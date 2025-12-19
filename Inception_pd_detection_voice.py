@@ -37,6 +37,8 @@ import math
 import re
 import os
 import json
+import argparse
+import random
 from tensorflow.keras.layers import Activation, Dense, Dropout, Flatten, BatchNormalization, Conv2D, MaxPooling2D, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -51,6 +53,43 @@ from sklearn.metrics import roc_curve
 from sklearn.metrics import roc_auc_score
 from matplotlib import pyplot as plt
 from sklearn.metrics import roc_curve
+
+
+def _safe_div(a: float, b: float) -> float:
+    return float(a) / float(b) if b else 0.0
+
+
+def _select_threshold_max_f1(y_true: np.ndarray, y_score: np.ndarray, num_thresholds: int = 101) -> float:
+    """Select a single threshold that maximizes (binary) F1 on (y_true, y_score)."""
+    y_true = np.asarray(y_true).astype(int)
+    y_score = np.asarray(y_score).astype(float)
+
+    if y_true.size == 0 or y_score.size == 0:
+        return 0.5
+
+    # If only one class present, threshold tuning is ill-defined.
+    if np.unique(y_true).size < 2:
+        return 0.5
+
+    thresholds = np.linspace(0.0, 1.0, int(num_thresholds))
+    best_t = 0.5
+    best_f1 = -1.0
+
+    for t in thresholds:
+        y_pred = (y_score >= t).astype(int)
+        tp = int(((y_pred == 1) & (y_true == 1)).sum())
+        fp = int(((y_pred == 1) & (y_true == 0)).sum())
+        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+
+        precision = _safe_div(tp, tp + fp)
+        recall = _safe_div(tp, tp + fn)
+        f1 = _safe_div(2.0 * precision * recall, precision + recall)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = float(t)
+
+    return best_t
 
 
 def wav_to_jpg_path(wav_path: str) -> str:
@@ -168,6 +207,7 @@ def build_data_generators_from_tsv(
         batch_size=batch_size,
         class_mode='binary',
         shuffle=True,
+        seed=seed,
     )
 
     val_datagen = ImageDataGenerator(
@@ -183,6 +223,7 @@ def build_data_generators_from_tsv(
         batch_size=batch_size,
         class_mode='binary',
         shuffle=False,
+        seed=seed,
     )
     return train_generator, validation_generator
 
@@ -218,7 +259,7 @@ def build_model():
     model.compile(
         loss='binary_crossentropy',
         optimizer=Adam(learning_rate=0.001),
-        metrics=['accuracy', tf.keras.metrics.AUC(name='auc')],
+        metrics=['accuracy', tf.keras.metrics.AUC(name='auc', curve='ROC')],
     )
     return model
 
@@ -231,6 +272,8 @@ def run_single_experiment(
     *,
     checkpoint_path: str,
     log_csv_path: str | None = None,
+    early_stop_patience: int = 5,
+    min_epochs: int = 5,
 ):
     model = build_model()
 
@@ -239,10 +282,20 @@ def run_single_experiment(
             filepath=checkpoint_path,
             save_best_only=True,
             save_weights_only=False,
-            monitor='val_loss',
-            mode='min',
+            monitor='val_auc',
+            mode='max',
         )
     ]
+    callbacks.append(
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_auc',
+            mode='max',
+            patience=early_stop_patience,
+            start_from_epoch=min_epochs,
+            restore_best_weights=False,
+            verbose=1,
+        )
+    )
     if log_csv_path is not None:
         callbacks.append(tf.keras.callbacks.CSVLogger(log_csv_path))
 
@@ -258,6 +311,23 @@ def run_single_experiment(
     return model, history
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description='Train InceptionV3 on spectrogram JPGs using TSV splits.')
+    p.add_argument('--train_tsv', type=str, required=True, help='Train TSV (columns: ID, AUDIOFILE, DIAGNOSIS)')
+    p.add_argument('--val_tsv', type=str, required=True, help='Validation TSV (columns: ID, AUDIOFILE, DIAGNOSIS)')
+    p.add_argument('--test_tsv', type=str, default=None, help='Optional test TSV for final evaluation + detailed TSV output')
+    p.add_argument('--output_dir', type=str, required=True, help='Output directory for this fold/run (files written directly here)')
+
+    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--early_stop_patience', type=int, default=5)
+    p.add_argument('--min_epochs', type=int, default=5, help='Do not allow early stopping before this many epochs')
+    p.add_argument('--batch_size', type=int, default=4)
+    p.add_argument('--img_size', type=int, default=600)
+    p.add_argument('--n_runs', type=int, default=1)
+    p.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    return p.parse_args()
+
+
 def compute_auc_from_generator(model, generator, batch_size: int) -> float:
     n = int(getattr(generator, "samples", len(getattr(generator, "classes", []))))
     steps = max(1, math.ceil(n / batch_size))
@@ -270,6 +340,14 @@ def compute_auc_from_generator(model, generator, batch_size: int) -> float:
     return float(roc_auc_score(y_true, y_prob))
 
 
+def compute_best_threshold_from_generator(model, generator, batch_size: int, *, threshold_grid: int = 101) -> float:
+    n = int(getattr(generator, "samples", len(getattr(generator, "classes", []))))
+    steps = max(1, math.ceil(n / batch_size))
+    y_prob = model.predict(generator, batch_size=batch_size, steps=steps, verbose=0).reshape(-1)[:n]
+    y_true = np.asarray(generator.classes).reshape(-1)[:n]
+    return float(_select_threshold_max_f1(y_true, y_prob, num_thresholds=threshold_grid))
+
+
 def write_detailed_results_tsv(
     *,
     model,
@@ -279,6 +357,7 @@ def write_detailed_results_tsv(
     img_cols: int,
     batch_size: int,
     out_path: str,
+    threshold: float = 0.5,
 ):
     df = load_tsv(test_tsv_path)
     class_to_index = {c: i for i, c in enumerate(classes)}
@@ -303,7 +382,7 @@ def write_detailed_results_tsv(
     # User convention: "logit" means sigmoid output probability in [0, 1]
     y_prob = model.predict(gen, batch_size=batch_size, steps=steps, verbose=0).reshape(-1)[:n]
     # y_prob = np.clip(y_prob, 0.0, 1.0)
-    y_pred = (y_prob >= 0.5).astype(int)
+    y_pred = (y_prob >= float(threshold)).astype(int)
 
     # Output: original test TSV columns + appended columns (ordered)
     df_out = df[["ID", "AUDIOFILE", "DIAGNOSIS"]].copy()
@@ -313,13 +392,13 @@ def write_detailed_results_tsv(
     df_out.to_csv(out_path, sep='\t', index=False)
 
 
-def summarize_results(model, eval_generator, batch_size, all_auc, *, out_summary_path: str | None = None):
+def summarize_results(model, eval_generator, batch_size, all_auc, *, threshold: float = 0.5, out_summary_path: str | None = None):
     print("\n")
     n = int(getattr(eval_generator, "samples", len(getattr(eval_generator, "classes", []))))
     steps = max(1, math.ceil(n / batch_size))
     Y_prob = model.predict(eval_generator, batch_size=batch_size, steps=steps, verbose=0).reshape(-1)[:n]
     y_true = np.asarray(eval_generator.classes).reshape(-1)[:n]
-    y_pred = (Y_prob >= 0.5).astype(int)
+    y_pred = (Y_prob >= float(threshold)).astype(int)
     print('Confusion Matrix')
     print(confusion_matrix(y_true, y_pred))
     print('Classification Report:')
@@ -334,6 +413,8 @@ def summarize_results(model, eval_generator, batch_size, all_auc, *, out_summary
     if out_summary_path is not None:
         summary = {
             "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+            "threshold": float(threshold),
+            "f1": float(metrics.f1_score(y_true, y_pred)) if len(np.unique(y_true)) >= 2 else None,
             "avg_auc": float(np.nanmean(all_auc)) if len(all_auc) else None,
             "std_auc": float(np.nanstd(all_auc)) if len(all_auc) else None,
             "n": int(n),
@@ -363,32 +444,37 @@ def plot_history(history, all_auc):
 
 
 def main():
+    args = parse_args()
     start = timeit.default_timer()
+
+    # Reproducibility: seed Python/NumPy/TensorFlow and Keras utils.
+    seed = int(getattr(args, "seed", 42))
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
 
     # Optional TSV inputs (minimal-change support):
     # TSV columns: ID, AUDIOFILE, DIAGNOSIS
     # AUDIOFILE is wav path; jpg path is derived by:
     #   wavpath.replace('fortrain', 'fortrain_jpg').replace('.wav', '.jpg')
-    train_tsv_path = "/home/yzhong/data/storage2/gits/CNN-PD-Voice/split_5fold/folds_v2.1_early_validation_newcut/folds_tsv_SUSTAINED-VOWELS_onlyA123/fold_1/sub_splits/train_earlybalance.tsv"
-    val_tsv_path = "/home/yzhong/data/storage2/gits/CNN-PD-Voice/split_5fold/folds_v2.1_early_validation_newcut/folds_tsv_SUSTAINED-VOWELS_onlyA123/fold_1/sub_splits/val_early6PD6HC.tsv"
+    train_tsv_path = args.train_tsv
+    val_tsv_path = args.val_tsv
+    test_tsv_path = args.test_tsv
 
-    test_tsv_path = "/home/yzhong/data/storage2/gits/CNN-PD-Voice/split_5fold/folds_v2.1_early_validation_newcut/folds_tsv_SUSTAINED-VOWELS_onlyA123/fold_1/test_early6PD6HC.tsv"
-
-
-    output_dir = "/home/yzhong/data/storage2/gits/CNN-PD-Voice/outputs/inception_runs"
-    run_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(output_dir, run_name)
+    run_dir = args.output_dir
     os.makedirs(run_dir, exist_ok=True)
     best_ckpt_path = os.path.join(run_dir, "best_model.keras")
     train_log_csv = os.path.join(run_dir, "train_log.csv")
     eval_summary_json = os.path.join(run_dir, "eval_summary.json")
     detailed_results_path = os.path.join(run_dir, "Neurovoz_and_PC_GITA_detailed_results.tsv")
+    tuned_threshold_path = os.path.join(run_dir, "tuned_threshold.json")
 
-    img_rows = 600
-    img_cols = 600
-    batch_size = 4
-    epochs = 10
-    n_runs = 1
+    img_rows = args.img_size
+    img_cols = args.img_size
+    batch_size = args.batch_size
+    epochs = args.epochs
+    n_runs = args.n_runs
 
     all_auc = []
     last_history = None
@@ -411,6 +497,7 @@ def main():
                 img_cols,
                 batch_size,
                 val_tsv_path=val_tsv_path,
+                seed=seed,
             )
             tsv_classes = [name for name, idx in sorted(train_generator.class_indices.items(), key=lambda x: x[1])]
             if test_tsv_path is not None:
@@ -427,6 +514,8 @@ def main():
             epochs,
             checkpoint_path=best_ckpt_path,
             log_csv_path=train_log_csv,
+            early_stop_patience=args.early_stop_patience,
+            min_epochs=args.min_epochs,
         )
 
         # Evaluate AUC on validation using probabilities
@@ -435,9 +524,26 @@ def main():
         last_model = model
 
     if last_model is not None and validation_generator is not None:
-        # Load best checkpoint (selected by val_loss) for final test evaluation
+        # Load best checkpoint (selected by val_auc) for final test evaluation
         best_model = tf.keras.models.load_model(best_ckpt_path)
-        summarize_results(best_model, eval_generator or validation_generator, batch_size, all_auc, out_summary_path=eval_summary_json)
+
+        # Tune threshold on validation set (best model), then apply to test evaluation.
+        tuned_threshold = compute_best_threshold_from_generator(best_model, validation_generator, batch_size, threshold_grid=101)
+        with open(tuned_threshold_path, "w", encoding="utf-8") as f:
+            json.dump({"threshold": float(tuned_threshold), "strategy": "max_f1", "grid": 101}, f, indent=2)
+        print(f"[THRESHOLD] Tuned on val (max_f1, grid=101): {tuned_threshold:.4f}")
+        print(f"[THRESHOLD] Saved to: {tuned_threshold_path}")
+
+        # Recompute ROC-AUC on the full validation set using sklearn for correctness/consistency
+        all_auc = [compute_auc_from_generator(best_model, validation_generator, batch_size)]
+        summarize_results(
+            best_model,
+            eval_generator or validation_generator,
+            batch_size,
+            all_auc,
+            threshold=tuned_threshold,
+            out_summary_path=eval_summary_json,
+        )
 
         if test_tsv_path is not None and tsv_classes is not None:
             write_detailed_results_tsv(
@@ -448,6 +554,7 @@ def main():
                 img_cols=img_cols,
                 batch_size=batch_size,
                 out_path=detailed_results_path,
+                threshold=tuned_threshold,
             )
         plot_history(last_history, all_auc)
 
